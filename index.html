@@ -1,0 +1,828 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Drift Log Analyzer</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+<script src="https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js"></script>
+<script src="https://unpkg.com/@ffmpeg/util@0.12.1/dist/umd/index.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0a0e0c; --surface:#10160f; --surface2:#161e15; --line:#26312a;
+    --green:#4fffa0; --green-dim:#2b8a5e; --amber:#ffb230; --red:#ff5a45;
+    --steel:#8b96a0; --text:#e8ecea; --text-dim:#6f7a72;
+    --mono:'JetBrains Mono', monospace; --ui:'Inter', system-ui, sans-serif;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  html,body{background:var(--bg); color:var(--text); font-family:var(--ui); overflow-x:hidden;}
+  #root{min-height:100vh;}
+  ::-webkit-scrollbar{width:8px; height:8px;}
+  ::-webkit-scrollbar-thumb{background:var(--line); border-radius:4px;}
+  ::-webkit-scrollbar-track{background:transparent;}
+  button{font-family:var(--ui); cursor:pointer;}
+  input[type=file]{display:none;}
+  
+  /* Plotly modebar overrides for dark theme */
+  .modebar-btn svg { fill: var(--text-dim) !important; }
+  .modebar-btn:hover svg { fill: var(--green) !important; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react,env">
+const { useState, useRef, useEffect, useCallback, useMemo } = React;
+
+/* ---------- constants ---------- */
+const COLS = ["id","timestamp_sec","flow_x","flow_y","comp_flow_x","comp_flow_y","velocity_x","velocity_y",
+  "position_x","position_y","position_z","gps_x","gps_y","gps_z","ned_x","ned_y","ned_z",
+  "ground_distance","quality","compass_heading","roll","pitch","roll_rate","pitch_rate",
+  "velocity_body_x","velocity_body_y","rotation_flow_rate_x","rotation_flow_rate_y"];
+
+const QUALITY_FLOOR = 50;          
+const ROT_RATE_SPIKE = 1.2;        
+const DRIFT_RATE_WARN = 0.25;      
+const DRIFT_RATE_FAULT = 0.6;      
+
+/* ---------- helpers ---------- */
+function fmt(n, d=2){
+  if (n === null || n === undefined || Number.isNaN(n)) return "--";
+  return Number(n).toFixed(d);
+}
+function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
+
+function loadSqlJs(){
+  return initSqlJs({ locateFile: f => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/${f}` });
+}
+
+/* ── AVI → MP4 (MJPEG re-encode via ffmpeg.wasm) ───────────────────────────
+ * Problem: opening this file via file:// gives the page origin "null".
+ * Browsers refuse new Worker(crossOriginUrl) from a null-origin page.
+ * ffmpeg.wasm 0.12.10's load() calls new Worker(cdnUrl) internally.
+ *
+ * Fix: temporarily replace window.Worker with a proxy that intercepts the
+ * ffmpeg internal Worker construction and substitutes a same-origin blob URL
+ * whose only content is `importScripts(originalUrl)`.  importScripts() inside
+ * a classic worker is explicitly allowed to fetch cross-origin URLs — even
+ * from a null-origin page — so this sidesteps the restriction cleanly.
+ * classWorkerURL is NOT used because it forces type:"module", which breaks
+ * importScripts().  The monkey-patch is removed immediately after load().
+ * ─────────────────────────────────────────────────────────────────────────── */
+let _ffmpegInstance = null;
+let _ffmpegLoading  = null;
+
+async function getFFmpeg(onProgress){
+  if (_ffmpegInstance) return _ffmpegInstance;
+  if (_ffmpegLoading)  return _ffmpegLoading;
+
+  _ffmpegLoading = (async () => {
+    // Wait for script tags to finish executing (they're async-injected by unpkg)
+    for (let i = 0; i < 100; i++){
+      if (window.FFmpegWASM && window.FFmpegUtil) break;
+      await new Promise(r => setTimeout(r, 100));
+    }
+    if (!window.FFmpegWASM || !window.FFmpegUtil)
+      throw new Error("ffmpeg.wasm failed to load from CDN (check network/ad-blocker).");
+
+    const { FFmpeg } = window.FFmpegWASM;
+    const base = "https://unpkg.com/@ffmpeg/core@0.12.10/dist/umd";
+
+    // ── monkey-patch window.Worker ──────────────────────────────────────────
+    // The ffmpeg.wasm UMD bundle calls:
+    //   new Worker(new URL(e.p + e.u(814), e.b), {type: void 0})
+    // where e.b resolves to the CDN path for 814.ffmpeg.js.
+    // We intercept that call and substitute a blob: URL whose sole content is
+    //   importScripts("<original CDN url>")
+    // A blob: Worker is same-origin by definition, so construction succeeds.
+    // importScripts() inside a classic worker fetches cross-origin freely.
+    const OriginalWorker = window.Worker;
+    window.Worker = function PatchedWorker(url, opts){
+      const urlStr = (url instanceof URL ? url.href : String(url));
+      if (urlStr.includes("ffmpeg") || urlStr.includes("814")){
+        const blob = new Blob([`importScripts(${JSON.stringify(urlStr)});`],
+                              { type: "text/javascript" });
+        const blobUrl = URL.createObjectURL(blob);
+        return new OriginalWorker(blobUrl, { ...opts, type: undefined });
+      }
+      return new OriginalWorker(url, opts);
+    };
+    // Copy static properties (e.g. Worker.MOCK) so nothing downstream breaks
+    Object.setPrototypeOf(window.Worker, OriginalWorker);
+
+    const ffmpeg = new FFmpeg();
+    if (onProgress) ffmpeg.on("progress", ({ progress }) =>
+      onProgress(clamp(Math.round(progress * 100), 0, 99)));
+
+    try {
+      await ffmpeg.load({
+        // Do NOT use toBlobURL here — blob:null/... URLs created on the main
+        // thread cannot be fetched from inside a Worker when page origin is
+        // "null" (file://). Pass raw CDN URLs instead; the worker fetches them
+        // itself via importScripts()/fetch(), which IS allowed cross-origin
+        // from within a worker context.
+        coreURL: `${base}/ffmpeg-core.js`,
+        wasmURL: `${base}/ffmpeg-core.wasm`,
+      });
+    } finally {
+      window.Worker = OriginalWorker; // always restore
+    }
+
+    _ffmpegInstance = ffmpeg;
+    return ffmpeg;
+  })();
+
+  try {
+    return await _ffmpegLoading;
+  } catch(e) {
+    _ffmpegLoading = null; // allow retry
+    throw e;
+  }
+}
+
+async function transcodeAviToMp4(file, onProgress){
+  const { fetchFile } = window.FFmpegUtil || {};
+  if (!fetchFile) throw new Error("ffmpeg.wasm util not loaded.");
+  const ffmpeg = await getFFmpeg(onProgress);
+  const inName  = "in.avi";
+  const outName = "out.mp4";
+  try {
+    await ffmpeg.writeFile(inName, await fetchFile(file));
+    // MJPEG → H.264 + AAC.  -preset veryfast keeps encode time reasonable.
+    await ffmpeg.exec([
+      "-i", inName,
+      "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+      "-c:a", "aac",
+      "-movflags", "+faststart",
+      outName
+    ]);
+    const data = await ffmpeg.readFile(outName);
+    return new Blob([data.buffer], { type: "video/mp4" });
+  } finally {
+    try { await ffmpeg.deleteFile(inName);  } catch(_){}
+    try { await ffmpeg.deleteFile(outName); } catch(_){}
+  }
+}
+
+function parseTelemetryDb(SQL, arrayBuffer){
+  const db = new SQL.Database(new Uint8Array(arrayBuffer));
+  const tables = db.exec("SELECT name FROM sqlite_master WHERE type='table'")[0]?.values.flat() || [];
+  if (!tables.includes("telemetry")) {
+    db.close();
+    throw new Error("No 'telemetry' table found in this database.");
+  }
+  const res = db.exec(`SELECT ${COLS.join(",")} FROM telemetry ORDER BY timestamp_sec ASC`);
+  db.close();
+  if (!res[0]) return [];
+  const { values } = res[0];
+  return values.map(row => {
+    const obj = {};
+    COLS.forEach((c,i) => obj[c] = row[i]);
+    return obj;
+  });
+}
+
+function analyze(rows){
+  if (!rows.length) return null;
+  const t0 = rows[0].timestamp_sec;
+  const out = rows.map((r,i) => {
+    const t = r.timestamp_sec - t0;
+    const dx = (r.position_x ?? 0) - (r.ned_x ?? 0);
+    const dy = (r.position_y ?? 0) - (r.ned_y ?? 0);
+    const dz = (r.position_z ?? 0) - (r.ned_z ?? 0);
+    const drift = Math.sqrt(dx*dx + dy*dy + dz*dz);
+    const rot = Math.sqrt((r.roll_rate ?? 0)**2 + (r.pitch_rate ?? 0)**2);
+    return { i, t, raw: r, drift, dx, dy, dz, rot };
+  });
+  
+  for (let k=0;k<out.length;k++){
+    const prev = out[Math.max(0,k-3)];
+    const dt = out[k].t - prev.t;
+    out[k].driftRate = dt > 0 ? (out[k].drift - prev.drift)/dt : 0;
+  }
+  
+  out.forEach(o => {
+    const lowQ = (o.raw.quality ?? 100) < QUALITY_FLOOR;
+    const spin = o.rot > ROT_RATE_SPIKE;
+    let level = "nominal";
+    if (o.driftRate > DRIFT_RATE_FAULT || lowQ && o.driftRate > DRIFT_RATE_WARN) level = "fault";
+    else if (o.driftRate > DRIFT_RATE_WARN || lowQ || spin) level = "caution";
+    o.level = level;
+    o.lowQ = lowQ;
+    o.spin = spin;
+  });
+  
+  const incidents = [];
+  let cur = null;
+  out.forEach(o => {
+    if (o.level !== "nominal"){
+      if (cur && o.t - cur.endT < 1.0){
+        cur.end = o.i; cur.endT = o.t;
+        cur.maxLevel = (o.level === "fault" || cur.maxLevel === "fault") ? "fault" : "caution";
+        cur.causes.add(o.lowQ ? "quality" : (o.spin ? "rotation" : "drift"));
+      } else {
+        if (cur) incidents.push(cur);
+        cur = { start:o.i, startT:o.t, end:o.i, endT:o.t, maxLevel:o.level,
+                causes: new Set([o.lowQ?"quality":(o.spin?"rotation":"drift")]) };
+      }
+    }
+  });
+  if (cur) incidents.push(cur);
+  const significant = incidents.filter(inc => (inc.endT - inc.startT) > 0.3 || inc.maxLevel === "fault");
+
+  const maxDrift = Math.max(...out.map(o=>o.drift));
+  const duration = out[out.length-1].t;
+  return { samples: out, incidents: significant, maxDrift, duration, t0 };
+}
+
+/* ---------- small UI atoms ---------- */
+function Stat({label, value, unit, tone}){
+  const color = tone === "fault" ? "var(--red)" : tone === "caution" ? "var(--amber)" : "var(--green)";
+  return (
+    <div style={{display:"flex", flexDirection:"column", gap:4, padding:"10px 14px",
+                 background:"var(--surface)", border:"1px solid var(--line)", borderRadius:6, minWidth:110, flex:1}}>
+      <span style={{fontSize:11, color:"var(--text-dim)", letterSpacing:"0.04em", textTransform:"uppercase"}}>{label}</span>
+      <span style={{fontFamily:"var(--mono)", fontSize:20, fontWeight:500, color}}>
+        {value}<span style={{fontSize:12, color:"var(--text-dim)", marginLeft:4}}>{unit}</span>
+      </span>
+    </div>
+  );
+}
+
+function Dropzone({label, accept, onFile, fileName, hint, disabled}){
+  const inputRef = useRef(null);
+  const [drag, setDrag] = useState(false);
+  return (
+    <div
+      onDragOver={e=>{e.preventDefault(); if(!disabled) setDrag(true);}}
+      onDragLeave={()=>setDrag(false)}
+      onDrop={e=>{
+        e.preventDefault(); setDrag(false);
+        if (!disabled && e.dataTransfer.files?.[0]) onFile(e.dataTransfer.files[0]);
+      }}
+      onClick={()=>{ if(!disabled) inputRef.current.click(); }}
+      style={{
+        flex:1, minHeight:140, border:`1px dashed ${drag?"var(--green)":"var(--line)"}`,
+        borderRadius:8, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center",
+        gap:8, cursor: disabled?"default":"pointer", background: drag? "rgba(79,255,160,0.04)":"var(--surface)",
+        opacity: disabled ? 0.55 : 1, transition:"border-color .15s, background .15s, opacity .15s"
+      }}>
+      <input ref={inputRef} type="file" accept={accept} disabled={disabled} onChange={e=>{
+        if (e.target.files?.[0]) onFile(e.target.files[0]);
+      }}/>
+      <div style={{fontFamily:"var(--mono)", fontSize:13, color: fileName ? "var(--green)" : "var(--steel)"}}>
+        {fileName || label}
+      </div>
+      <div style={{fontSize:11, color:"var(--text-dim)"}}>{hint}</div>
+    </div>
+  );
+}
+
+/* ---------- 3D Trajectory Plot (Plotly) ---------- */
+function Trajectory3D({ analysis, currentIdx, height = 460 }) {
+  const divRef = useRef(null);
+  const isInitialized = useRef(false);
+
+  // Initial full plot setup
+  useEffect(() => {
+    if (!analysis || !divRef.current || !window.Plotly) return;
+
+    const { samples } = analysis;
+    const px = samples.map(s => s.raw.position_x);
+    const py = samples.map(s => s.raw.position_y);
+    // Invert Z: Drones typically use NED (Z positive down). Inverting it maps altitude going UP on our plot.
+    const pz = samples.map(s => -(s.raw.position_z || 0)); 
+    
+    const nx = samples.map(s => s.raw.ned_x);
+    const ny = samples.map(s => s.raw.ned_y);
+    const nz = samples.map(s => -(s.raw.ned_z || 0));
+
+    const traceVIO = {
+      x: px, y: py, z: pz,
+      type: 'scatter3d', mode: 'lines', name: 'VIO Position',
+      line: { color: '#4fffa0', width: 4 },
+      hoverinfo: 'none'
+    };
+
+    const traceGPS = {
+      x: nx, y: ny, z: nz,
+      type: 'scatter3d', mode: 'lines', name: 'GPS (NED)',
+      line: { color: '#8b96a0', width: 2, dash: 'dash' },
+      hoverinfo: 'none'
+    };
+
+    const traceCursor = {
+      x: [px[currentIdx]], y: [py[currentIdx]], z: [pz[currentIdx]],
+      type: 'scatter3d', mode: 'markers', name: 'Current',
+      marker: { color: '#ffb230', size: 6, symbol: 'circle', line: { color: '#0a0e0c', width: 1 } },
+      hoverinfo: 'none'
+    };
+
+    const layout = {
+      autosize: true,
+      margin: { l: 0, r: 0, b: 0, t: 40 },
+      paper_bgcolor: 'rgba(0,0,0,0)',
+      plot_bgcolor: 'rgba(0,0,0,0)',
+      scene: {
+        xaxis: { title: 'X (m)', showbackground: false, color: '#6f7a72', gridcolor: '#26312a', zerolinecolor: '#26312a' },
+        yaxis: { title: 'Y (m)', showbackground: false, color: '#6f7a72', gridcolor: '#26312a', zerolinecolor: '#26312a' },
+        zaxis: { title: 'Alt (m)', showbackground: false, color: '#6f7a72', gridcolor: '#26312a', zerolinecolor: '#26312a' },
+        bgcolor: 'transparent',
+        camera: { eye: {x: 1.5, y: 1.5, z: 1.2} } // Default nice isometric-ish view
+      },
+      showlegend: true,
+      legend: { x: 0, y: 1, font: { color: '#e8ecea', family: 'JetBrains Mono', size: 11 }, bgcolor: 'rgba(16, 22, 15, 0.7)' }
+    };
+
+    const config = { displayModeBar: true, displaylogo: false, responsive: true, modeBarButtonsToRemove: ['resetCameraDefault3d'] };
+
+    window.Plotly.newPlot(divRef.current, [traceVIO, traceGPS, traceCursor], layout, config);
+    isInitialized.current = true;
+
+    return () => {
+      if (divRef.current) window.Plotly.purge(divRef.current);
+      isInitialized.current = false;
+    };
+  }, [analysis]);
+
+  // Fast update for cursor marker to avoid re-rendering the whole 3D mesh at 60fps
+  useEffect(() => {
+    if (!isInitialized.current || !analysis || !divRef.current || !window.Plotly) return;
+    const s = analysis.samples[currentIdx];
+    if (!s) return;
+    
+    const update = {
+      x: [[s.raw.position_x]],
+      y: [[s.raw.position_y]],
+      z: [[-(s.raw.position_z || 0)]]
+    };
+    
+    // index 2 is the traceCursor
+    window.Plotly.restyle(divRef.current, update, [2]);
+  }, [currentIdx, analysis]);
+
+  return (
+    <div style={{ position: 'relative', height, width: '100%', background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 8, overflow: 'hidden' }}>
+      <div style={{ position: 'absolute', top: 14, left: 14, zIndex: 10, fontSize: 12, color: 'var(--steel)' }}>3D Flight Trajectory (Drag to Rotate)</div>
+      <div ref={divRef} style={{ width: '100%', height: '100%' }} />
+    </div>
+  );
+}
+
+/* ---------- divergence tape ---------- */
+function DivergenceTape({ analysis, currentIdx, onScrub }){
+  const canvasRef = useRef(null);
+  const wrapRef = useRef(null);
+
+  useEffect(() => {
+    if (!analysis || !canvasRef.current) return;
+    const canvas = canvasRef.current;
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    canvas.width = w*dpr; canvas.height = h*dpr;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.scale(dpr,dpr);
+    ctx.clearRect(0,0,w,h);
+
+    const { samples, maxDrift, incidents } = analysis;
+    const n = samples.length;
+    const padTop = 6, padBot = 6;
+    const plotH = h - padTop - padBot;
+
+    incidents.forEach(inc => {
+      const x1 = (inc.start/n)*w, x2 = (inc.end/n)*w;
+      ctx.fillStyle = inc.maxLevel === "fault" ? "rgba(255,90,69,0.16)" : "rgba(255,178,48,0.12)";
+      ctx.fillRect(x1, 0, Math.max(2,x2-x1), h);
+    });
+
+    ctx.beginPath();
+    samples.forEach((s,i) => {
+      const x = (i/n)*w;
+      const y = padTop + plotH - (s.drift/Math.max(maxDrift,0.001))*plotH;
+      if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    });
+    ctx.strokeStyle = "#4fffa0";
+    ctx.lineWidth = 1.4;
+    ctx.stroke();
+
+    ctx.lineTo(w, padTop+plotH); ctx.lineTo(0, padTop+plotH); ctx.closePath();
+    ctx.fillStyle = "rgba(79,255,160,0.06)";
+    ctx.fill();
+  }, [analysis]);
+
+  const handlePointer = useCallback((e) => {
+    if (!analysis || !wrapRef.current) return;
+    const rect = wrapRef.current.getBoundingClientRect();
+    const frac = clamp((e.clientX - rect.left)/rect.width, 0, 1);
+    const idx = Math.round(frac * (analysis.samples.length-1));
+    onScrub(idx);
+  }, [analysis, onScrub]);
+
+  if (!analysis) return null;
+  const n = analysis.samples.length;
+  const markerLeft = `${(currentIdx/Math.max(n-1,1))*100}%`;
+
+  return (
+    <div style={{display:"flex", flexDirection:"column", gap:6}}>
+      <div style={{display:"flex", justifyContent:"space-between", fontSize:11, color:"var(--text-dim)", fontFamily:"var(--mono)"}}>
+        <span>T+00:00.0</span>
+        <span style={{color:"var(--steel)"}}>position vs gps divergence magnitude — drag to scrub</span>
+        <span>T+{fmt(analysis.duration,1)}s</span>
+      </div>
+      <div
+        ref={wrapRef}
+        onMouseDown={e=>{handlePointer(e);
+          const move = ev=>handlePointer(ev);
+          const up = ()=>{window.removeEventListener("mousemove",move); window.removeEventListener("mouseup",up);};
+          window.addEventListener("mousemove",move); window.addEventListener("mouseup",up);
+        }}
+        style={{position:"relative", height:64, background:"var(--surface)", border:"1px solid var(--line)",
+                borderRadius:6, cursor:"crosshair", overflow:"hidden"}}>
+        <canvas ref={canvasRef} style={{width:"100%", height:"100%", display:"block"}}/>
+        <div style={{position:"absolute", top:0, bottom:0, left:markerLeft, width:2,
+                      background:"var(--text)", boxShadow:"0 0 6px rgba(255,255,255,0.6)", pointerEvents:"none"}}/>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- CDI-style live needle gauge ---------- */
+function CDINeedle({ value, maxAbs=2 }){
+  const frac = clamp(value / maxAbs, -1, 1);
+  const pct = 50 + frac*45;
+  const tone = Math.abs(value) > maxAbs*0.66 ? "var(--red)" : Math.abs(value) > maxAbs*0.33 ? "var(--amber)" : "var(--green)";
+  return (
+    <div style={{position:"relative", height:34, background:"var(--surface2)", border:"1px solid var(--line)", borderRadius:4}}>
+      <div style={{position:"absolute", left:"50%", top:2, bottom:2, width:1, background:"var(--line)"}}/>
+      {[10,30,70,90].map(p => (
+        <div key={p} style={{position:"absolute", left:`${p}%`, top:8, bottom:8, width:1, background:"var(--line)"}}/>
+      ))}
+      <div style={{position:"absolute", left:`calc(${pct}% - 5px)`, top:4, bottom:4, width:10,
+                    background:tone, borderRadius:2, transition:"left .05s linear, background .15s"}}/>
+    </div>
+  );
+}
+
+/* ---------- mini line chart for a single channel pair ---------- */
+function ChannelChart({ id, analysis, fields, colors, currentIdx, height=120, yLabel }){
+  const canvasRef = useRef(null);
+  const chartRef = useRef(null);
+
+  useEffect(() => {
+    if (!analysis) return;
+    const ctx = canvasRef.current.getContext("2d");
+    const labels = analysis.samples.map(s => s.t.toFixed(1));
+    const datasets = fields.map((f,idx) => ({
+      label: f.label,
+      data: analysis.samples.map(s => f.get(s)),
+      borderColor: colors[idx],
+      backgroundColor: "transparent",
+      borderWidth: 1.3,
+      pointRadius: 0,
+      borderDash: f.dash || [],
+      tension: 0.15,
+    }));
+    if (chartRef.current) chartRef.current.destroy();
+    chartRef.current = new Chart(ctx, {
+      type: "line",
+      data: { labels, datasets },
+      options: {
+        responsive: true, maintainAspectRatio: false, animation: false,
+        interaction: { mode: "index", intersect: false },
+        plugins: { legend: { display:false }, tooltip: { enabled:false } },
+        scales: {
+          x: { display:false },
+          y: {
+            ticks: { color:"#6f7a72", font:{ family:"JetBrains Mono", size:10 } },
+            grid: { color:"rgba(38,49,42,0.6)" },
+            title: yLabel ? { display:true, text:yLabel, color:"#6f7a72", font:{size:10} } : undefined
+          }
+        }
+      },
+      plugins: [{
+        id: "cursor-"+id,
+        afterDraw(chart){
+          const x = chart.scales.x.getPixelForValue(currentIdx);
+          const {top,bottom} = chart.chartArea;
+          const c = chart.ctx;
+          c.save();
+          c.strokeStyle = "rgba(232,236,234,0.55)";
+          c.lineWidth = 1;
+          c.beginPath(); c.moveTo(x,top); c.lineTo(x,bottom); c.stroke();
+          c.restore();
+        }
+      }]
+    });
+    return () => { if (chartRef.current) chartRef.current.destroy(); };
+  }, [analysis]);
+
+  useEffect(() => {
+    if (chartRef.current) chartRef.current.draw();
+  }, [currentIdx]);
+
+  return <div style={{position:"relative", height, width:"100%"}}>
+    <canvas ref={canvasRef} role="img" aria-label={`${yLabel} over time`}/>
+  </div>;
+}
+
+/* ---------- incident list ---------- */
+function IncidentRow({ inc, onJump, t0 }){
+  const tone = inc.maxLevel === "fault" ? "var(--red)" : "var(--amber)";
+  const causeLabel = [...inc.causes].map(c => ({quality:"flow quality drop", rotation:"high rotation rate", drift:"drift acceleration"}[c])).join(" + ");
+  return (
+    <div onClick={()=>onJump(inc.start)}
+      style={{display:"flex", alignItems:"center", gap:12, padding:"10px 12px", borderRadius:6,
+               border:"1px solid var(--line)", background:"var(--surface)", cursor:"pointer"}}>
+      <div style={{width:8, height:8, borderRadius:"50%", background:tone, flexShrink:0}}/>
+      <div style={{fontFamily:"var(--mono)", fontSize:13, minWidth:130}}>
+        T+{fmt(inc.startT,1)}s &rarr; T+{fmt(inc.endT,1)}s
+      </div>
+      <div style={{fontSize:13, color:"var(--steel)", flex:1}}>{causeLabel}</div>
+      <div style={{fontFamily:"var(--mono)", fontSize:11, color:tone, textTransform:"uppercase", letterSpacing:"0.04em"}}>
+        {inc.maxLevel}
+      </div>
+    </div>
+  );
+}
+
+/* ---------- main app ---------- */
+function App(){
+  const [SQL, setSQL] = useState(null);
+  const [dbFile, setDbFile] = useState(null);
+  const [videoFile, setVideoFile] = useState(null);
+  const [videoUrl, setVideoUrl] = useState(null);
+  const [analysis, setAnalysis] = useState(null);
+  const [error, setError] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [converting, setConverting] = useState(false);
+  const [convertProgress, setConvertProgress] = useState(0);
+  const [currentIdx, setCurrentIdx] = useState(0);
+  const videoRef = useRef(null);
+  const rafRef = useRef(null);
+
+  useEffect(() => { loadSqlJs().then(setSQL).catch(e=>setError("Failed to initialize SQLite engine: "+e.message)); }, []);
+
+  const handleDbFile = useCallback(async (file) => {
+    setError(null);
+    setDbFile(file.name);
+    if (!SQL){ setError("SQLite engine still loading, try again in a moment."); return; }
+    setLoading(true);
+    try{
+      const buf = await file.arrayBuffer();
+      const rows = parseTelemetryDb(SQL, buf);
+      if (!rows.length) throw new Error("Telemetry table is empty.");
+      const a = analyze(rows);
+      setAnalysis(a);
+      setCurrentIdx(0);
+    } catch(e){
+      setError(e.message);
+      setAnalysis(null);
+    } finally { setLoading(false); }
+  }, [SQL]);
+
+  const handleVideoFile = useCallback(async (file) => {
+    const isAvi = /\.avi$/i.test(file.name);
+    if (!isAvi){
+      setVideoFile(file.name);
+      setVideoUrl(URL.createObjectURL(file));
+      return;
+    }
+    // AVI files from this drone are MJPEG-encoded — browsers can't play MJPEG,
+    // so a simple container rename doesn't work.  Transcode to H.264/MP4.
+    setError(null);
+    setVideoFile(file.name);
+    setConverting(true);
+    setConvertProgress(0);
+    try {
+      const mp4Blob = await transcodeAviToMp4(file, setConvertProgress);
+      setConvertProgress(100);
+      setVideoUrl(URL.createObjectURL(mp4Blob));
+      setVideoFile(file.name.replace(/\.avi$/i, ".mp4") + " (transcoded)");
+    } catch(e) {
+      setError("AVI → MP4 failed: " + e.message);
+      setVideoFile(null);
+    } finally {
+      setConverting(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!videoRef.current || !analysis) return;
+    const vid = videoRef.current;
+    const tick = () => {
+      if (!vid.paused && analysis){
+        const t = vid.currentTime;
+        let lo=0, hi=analysis.samples.length-1;
+        while (lo<hi){
+          const mid = (lo+hi)>>1;
+          if (analysis.samples[mid].t < t) lo = mid+1; else hi = mid;
+        }
+        setCurrentIdx(lo);
+      }
+      rafRef.current = requestAnimationFrame(tick);
+    };
+    rafRef.current = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafRef.current);
+  }, [analysis, videoUrl]);
+
+  const jumpTo = useCallback((idx) => {
+    setCurrentIdx(idx);
+    if (videoRef.current && analysis){
+      videoRef.current.currentTime = analysis.samples[idx].t;
+    }
+  }, [analysis]);
+
+  const sample = analysis ? analysis.samples[currentIdx] : null;
+
+  const summaryTone = useMemo(() => {
+    if (!analysis) return "nominal";
+    const worst = analysis.incidents.some(i=>i.maxLevel==="fault") ? "fault"
+      : analysis.incidents.length ? "caution" : "nominal";
+    return worst;
+  }, [analysis]);
+
+  return (
+    <div style={{maxWidth:1280, margin:"0 auto", padding:"28px 24px 64px"}}>
+      {/* header */}
+      <div style={{display:"flex", justifyContent:"space-between", alignItems:"baseline", marginBottom:24,
+                    borderBottom:"1px solid var(--line)", paddingBottom:16}}>
+        <div>
+          <div style={{fontFamily:"var(--mono)", fontSize:20, fontWeight:700, letterSpacing:"0.02em"}}>
+            DRIFT<span style={{color:"var(--green)"}}>·</span>LOG
+          </div>
+          <div style={{fontSize:12, color:"var(--text-dim)", marginTop:2}}>
+            VIO position vs GPS divergence analysis, synced to flight footage
+          </div>
+        </div>
+        {analysis && (
+          <div style={{fontFamily:"var(--mono)", fontSize:11, color:"var(--text-dim)", textAlign:"right"}}>
+            {analysis.samples.length} samples &middot; {fmt(analysis.duration,1)}s logged
+          </div>
+        )}
+      </div>
+
+      {/* upload zone */}
+      {!analysis && (
+        <div style={{display:"flex", flexDirection:"column", gap:16}}>
+          <div style={{display:"flex", gap:16}}>
+            <Dropzone label="Drop telemetry .db" accept=".db,.sqlite,.sqlite3" onFile={handleDbFile}
+                       fileName={dbFile} hint="SQLite file with a telemetry table"/>
+            <Dropzone label="Drop flight video" accept="video/*,.avi" onFile={handleVideoFile}
+                       fileName={converting ? `converting… (${convertProgress}%)` : videoFile}
+                       hint="MP4 / MOV / AVI — AVI is re-encoded to H.264"
+                       disabled={converting}/>
+          </div>
+          {converting && (
+            <div style={{display:"flex", alignItems:"center", gap:10,
+                         fontFamily:"var(--mono)", fontSize:12, color:"var(--amber)"}}>
+              <span>MJPEG → H.264&nbsp;&nbsp;{convertProgress}%</span>
+              <div style={{flex:1, maxWidth:240, height:4, borderRadius:2,
+                           background:"var(--surface2)", overflow:"hidden"}}>
+                <div style={{height:"100%", width:`${convertProgress}%`,
+                             background:"var(--amber)", transition:"width .3s"}}/>
+              </div>
+              <span style={{color:"var(--text-dim)"}}>this takes a minute — keep tab open</span>
+            </div>
+          )}
+          {loading && <div style={{fontFamily:"var(--mono)", fontSize:12, color:"var(--steel)"}}>parsing telemetry...</div>}
+          {error && <div style={{fontFamily:"var(--mono)", fontSize:12, color:"var(--red)",
+                                   border:"1px solid var(--red)", borderRadius:6, padding:"10px 12px",
+                                   background:"rgba(255,90,69,0.08)"}}>{error}</div>}
+          <div style={{fontSize:12, color:"var(--text-dim)", lineHeight:1.6}}>
+            Expects the flat telemetry schema (timestamp_sec, position_x/y/z, gps_x/y/z, quality, ground_distance,
+            roll_rate/pitch_rate, flow channels). Video is assumed to start at telemetry row 0 — there's no offset control yet.
+          </div>
+        </div>
+      )}
+
+      {/* main analysis view */}
+      {analysis && (
+        <div style={{display:"flex", flexDirection:"column", gap:20}}>
+
+          {/* top stats row */}
+          <div style={{display:"flex", gap:12, flexWrap:"wrap"}}>
+            <Stat label="current drift" value={fmt(sample.drift,2)} unit="m"
+                  tone={sample.level === "nominal" ? "nominal" : sample.level}/>
+            <Stat label="peak drift" value={fmt(analysis.maxDrift,2)} unit="m" tone={summaryTone}/>
+            <Stat label="flow quality" value={fmt(sample.raw.quality,0)} unit="/255"
+                  tone={sample.lowQ ? "fault" : "nominal"}/>
+            <Stat label="ground dist" value={fmt(sample.raw.ground_distance,2)} unit="m" tone="nominal"/>
+            <Stat label="rotation rate" value={fmt(sample.rot,2)} unit="rad/s" tone={sample.spin?"caution":"nominal"}/>
+            <Stat label="incidents flagged" value={analysis.incidents.length} unit="" tone={summaryTone}/>
+          </div>
+
+          {/* video + needles */}
+          <div style={{display:"flex", gap:20}}>
+            <div style={{flex:1.4, minWidth:0}}>
+              {videoUrl ? (
+                <video ref={videoRef} src={videoUrl} controls style={{width:"100%", borderRadius:8,
+                       border:"1px solid var(--line)", background:"#000", display:"block"}}/>
+              ) : (
+                <div style={{aspectRatio:"16/9", border:"1px dashed var(--line)", borderRadius:8,
+                              display:"flex", alignItems:"center", justifyContent:"center",
+                              color:"var(--text-dim)", fontSize:13}}>
+                  No video loaded — telemetry-only mode
+                </div>
+              )}
+            </div>
+            <div style={{flex:1, minWidth:260, display:"flex", flexDirection:"column", gap:14}}>
+              <div>
+                <div style={{fontSize:11, color:"var(--text-dim)", marginBottom:4, textTransform:"uppercase", letterSpacing:"0.04em"}}>
+                  X divergence (pos &minus; gps)
+                </div>
+                <CDINeedle value={sample.dx} maxAbs={Math.max(1, analysis.maxDrift*0.8)}/>
+              </div>
+              <div>
+                <div style={{fontSize:11, color:"var(--text-dim)", marginBottom:4, textTransform:"uppercase", letterSpacing:"0.04em"}}>
+                  Y divergence (pos &minus; gps)
+                </div>
+                <CDINeedle value={sample.dy} maxAbs={Math.max(1, analysis.maxDrift*0.8)}/>
+              </div>
+              <div>
+                <div style={{fontSize:11, color:"var(--text-dim)", marginBottom:4, textTransform:"uppercase", letterSpacing:"0.04em"}}>
+                  Z divergence (pos &minus; gps)
+                </div>
+                <CDINeedle value={sample.dz} maxAbs={Math.max(1, analysis.maxDrift*0.8)}/>
+              </div>
+              <div style={{fontFamily:"var(--mono)", fontSize:11, color:"var(--text-dim)", marginTop:4}}>
+                T+{fmt(sample.t,2)}s &middot; row {sample.i}
+              </div>
+            </div>
+          </div>
+
+          {/* divergence tape: signature scrubber */}
+          <DivergenceTape analysis={analysis} currentIdx={currentIdx} onScrub={jumpTo}/>
+
+          {/* 3D Trajectory Map */}
+          <Trajectory3D analysis={analysis} currentIdx={currentIdx} />
+
+          {/* incidents */}
+          {analysis.incidents.length > 0 && (
+            <div>
+              <div style={{fontSize:13, color:"var(--steel)", marginBottom:8}}>
+                Flagged incidents — click to jump
+              </div>
+              <div style={{display:"flex", flexDirection:"column", gap:6}}>
+                {analysis.incidents.map((inc,i) => <IncidentRow key={i} inc={inc} onJump={jumpTo}/>)}
+              </div>
+            </div>
+          )}
+          {analysis.incidents.length === 0 && (
+            <div style={{fontSize:13, color:"var(--green)", fontFamily:"var(--mono)"}}>
+              No drift, quality, or rotation anomalies above threshold across the logged flight.
+            </div>
+          )}
+
+          {/* charts */}
+          <div style={{display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(400px, 1fr))", gap:16}}>
+            <div style={{background:"var(--surface)", border:"1px solid var(--line)", borderRadius:8, padding:14}}>
+              <div style={{fontSize:12, color:"var(--steel)", marginBottom:8}}>position vs ned — X axis</div>
+              <ChannelChart id="px" analysis={analysis} currentIdx={currentIdx} yLabel="meters"
+                fields={[{label:"position_x", get:s=>s.raw.position_x},{label:"ned_x", get:s=>s.raw.ned_x, dash:[4,3]}]}
+                colors={["#4fffa0","#8b96a0"]}/>
+            </div>
+            <div style={{background:"var(--surface)", border:"1px solid var(--line)", borderRadius:8, padding:14}}>
+              <div style={{fontSize:12, color:"var(--steel)", marginBottom:8}}>position vs ned — Y axis</div>
+              <ChannelChart id="py" analysis={analysis} currentIdx={currentIdx} yLabel="meters"
+                fields={[{label:"position_y", get:s=>s.raw.position_y},{label:"ned_y", get:s=>s.raw.ned_y, dash:[4,3]}]}
+                colors={["#4fffa0","#8b96a0"]}/>
+            </div>
+            <div style={{background:"var(--surface)", border:"1px solid var(--line)", borderRadius:8, padding:14}}>
+              <div style={{fontSize:12, color:"var(--steel)", marginBottom:8}}>flow quality &amp; ground distance</div>
+              <ChannelChart id="q" analysis={analysis} currentIdx={currentIdx} yLabel="quality / m"
+                fields={[{label:"quality", get:s=>s.raw.quality},{label:"ground_distance", get:s=>s.raw.ground_distance, dash:[4,3]}]}
+                colors={["#ffb230","#8b96a0"]}/>
+            </div>
+            <div style={{background:"var(--surface)", border:"1px solid var(--line)", borderRadius:8, padding:14}}>
+              <div style={{fontSize:12, color:"var(--steel)", marginBottom:8}}>roll / pitch rate (rotation flag input)</div>
+              <ChannelChart id="rr" analysis={analysis} currentIdx={currentIdx} yLabel="rad/s"
+                fields={[{label:"roll_rate", get:s=>s.raw.roll_rate},{label:"pitch_rate", get:s=>s.raw.pitch_rate, dash:[4,3]}]}
+                colors={["#ff5a45","#8b96a0"]}/>
+            </div>
+          </div>
+
+          <div style={{display:"flex", gap:12}}>
+            <button onClick={()=>{setAnalysis(null); setDbFile(null); setVideoFile(null); setVideoUrl(null); setError(null); setConverting(false); setConvertProgress(0);}}
+              style={{background:"var(--surface)", border:"1px solid var(--line)", color:"var(--text)",
+                       borderRadius:6, padding:"8px 14px", fontSize:13}}>
+              Load a different flight
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
